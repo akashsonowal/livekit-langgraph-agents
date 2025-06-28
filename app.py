@@ -14,7 +14,7 @@ from livekit.plugins import silero  # For voice activity detection (VAD), option
 
 from config import Config
 from transcription import get_transcriber
-from llm import get_llm_model
+from voicing_app import get_llm_model
 from tts import get_tts_engine
 
 load_dotenv()  # Ensure environment is loaded

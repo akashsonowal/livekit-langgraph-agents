@@ -1,3 +1,8 @@
-livekit-agents[openai,silero,deepgram,cartesia,turn-detector]~=1.0
+# livekit-agents[openai,silero,deepgram,cartesia,turn-detector]~=1.0
+# langgraph
+# langchain-openai
+python-dotenv
+
+langchain[openai]
 langgraph
-langchain-openai
+livekit-agents[openai,silero,langchain,deepgram,turn_detector]
