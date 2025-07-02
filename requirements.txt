@@ -1,8 +1,10 @@
-# livekit-agents[openai,silero,deepgram,cartesia,turn-detector]~=1.0
-# langgraph
-# langchain-openai
+#livekit-agents[openai,silero,deepgram,cartesia,turn-detector]~=1.0
+#langgraph
+#langchain-openai
 python-dotenv
 
 langchain[openai]
 langgraph
+livekit-plugins-noise-cancellation~=0.2
 livekit-agents[openai,silero,langchain,deepgram,turn_detector]
+livekit-agents[elevenlabs]~=1.0

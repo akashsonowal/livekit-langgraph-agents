@@ -8,3 +8,6 @@ env/
 venv/
 ENV/
 .env
+myenv/
+logs/
+*.log
