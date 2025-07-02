@@ -1,14 +1,33 @@
 import logging
 import os
 from typing import Annotated, TypedDict
-
+import asyncio
 import time
 from datetime import datetime
+
+# ---------- Logging Setup ----------
+log_folder = "logs"
+os.makedirs(log_folder, exist_ok=True)
+
+log_file_path = os.path.join(log_folder, "livekit_silent_filler_agent.log")
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.FileHandler(log_file_path, mode='a'),
+        logging.StreamHandler()
+    ]
+)
+# -----------------------------------
+
 from dotenv import load_dotenv
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import BaseMessage
 from langgraph.graph import START, StateGraph
 from langgraph.graph.message import add_messages
+
+from collections.abc import AsyncIterable
 
 from livekit.agents import (
     Agent,
@@ -18,6 +37,7 @@ from livekit.agents import (
     RoomInputOptions,
     WorkerOptions,
     cli,
+    llm,
     MetricsCollectedEvent
 )
 
@@ -32,20 +52,9 @@ from livekit.agents.metrics import (
 
 from livekit.plugins import deepgram, elevenlabs, langchain, silero, noise_cancellation, openai
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
-
-# ---------- Logging Setup ----------
-log_file_path = "livekit_agent.log"
-logging.basicConfig(
-    level=logging.DEBUG,  # Change to logging.INFO if you want less verbosity
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.FileHandler(log_file_path, mode='a'),
-        logging.StreamHandler()
-    ]
-)
+from livekit.agents.llm.chat_context import ChatContext, ChatMessage
 
 logger = logging.getLogger("basic-agent")
-# -----------------------------------
 
 load_dotenv()
 
@@ -65,31 +74,50 @@ def prewarm(proc: JobProcess):
 class State(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
 
-def create_graph() -> StateGraph:
-    openai_llm = init_chat_model(model="gpt-4o-mini")
+class PreResponseAgent(Agent):
+    def __init__(self):
+        super().__init__(
+            instructions="You are a helpful assistant",
+            llm=openai.LLM(model="gpt-4o-mini"),
+            tts=elevenlabs.TTS()
+        )
+        self._fast_llm = openai.LLM(model="gpt-3.5-turbo")
+        self._fast_llm_prompt = llm.ChatMessage(
+            role="system",
+            content=[
+                "Generate a very short instant response to the user's message with 5 to 10 words.",
+                "Do not answer the questions directly. Examples: OK, Hm..., let me think about that, "
+                "wait a moment, that's a good question, etc.",
+            ],
+        )
 
-    def chatbot_node(state: State):
-        return {"messages": [openai_llm.invoke(state["messages"])]}
+    async def on_user_turn_completed(self, turn_ctx: ChatContext, new_message: ChatMessage):
+        fast_llm_ctx = turn_ctx.copy(
+            exclude_instructions=True, exclude_function_call=True
+        ).truncate(max_items=3)
+        fast_llm_ctx.items.insert(0, self._fast_llm_prompt)
+        fast_llm_ctx.items.append(new_message)
 
-    builder = StateGraph(State)
-    builder.add_node("chatbot", chatbot_node)
-    builder.add_edge(START, "chatbot")
-    return builder.compile()
+        fast_llm_fut = asyncio.Future()
+
+        async def _fast_llm_reply() -> AsyncIterable[str]:
+            filler_response = ""
+            start_time = time.time()
+            async for chunk in self._fast_llm.chat(chat_ctx=fast_llm_ctx).to_str_iterable():
+                filler_response += chunk
+                yield chunk
+            end_time = time.time()
+            logger.debug(f"Fast response time: {(end_time - start_time) * 1000:.2f} ms")
+            fast_llm_fut.set_result(filler_response)
+
+        self.session.say(_fast_llm_reply(), add_to_chat_ctx=False)
+
+        filler_response = await fast_llm_fut
+        logger.info(f"Fast response: {filler_response}")
+        turn_ctx.add_message(role="assistant", content=filler_response, interrupted=False)
 
 async def entrypoint(ctx: JobContext):
-    graph = create_graph()
-
-    agent = Agent(
-        instructions=prompt,
-        llm=langchain.LLMAdapter(graph),
-    )
-
-    session = AgentSession(
-        vad=ctx.proc.userdata["vad"],
-        stt=deepgram.STT(model="nova-3", language="multi"),
-        tts=elevenlabs.TTS(),
-        turn_detection=MultilingualModel(),
-    )
+    await ctx.connect()
 
     current_turn_metrics = {
         'eou_delay': None,
@@ -118,6 +146,13 @@ async def entrypoint(ctx: JobContext):
             for k in current_turn_metrics:
                 current_turn_metrics[k] = None
 
+    session = AgentSession(
+        vad=ctx.proc.userdata["vad"],
+        stt=deepgram.STT(model="nova-3", language="multi"),
+        tts=elevenlabs.TTS(),
+        turn_detection=MultilingualModel(),
+    )
+
     collector = UsageCollector()
 
     @session.on("metrics_collected")
@@ -125,10 +160,9 @@ async def entrypoint(ctx: JobContext):
         m = ev.metrics
 
         if isinstance(ev.metrics, LLMMetrics):
-            logger.debug(f"Processing LLM metrics: {ev.metrics}")
+            logger.debug(f"LLM Metrics: {ev.metrics}")
             if hasattr(ev.metrics, 'duration'):
-                duration_ms = ev.metrics.duration * 1000
-                logger.debug(f"Observed LLM latency: {duration_ms}ms")
+                logger.debug(f"LLM Duration: {ev.metrics.duration * 1000} ms")
             if hasattr(ev.metrics, 'ttft'):
                 current_turn_metrics['llm_ttft'] = ev.metrics.ttft
                 calculate_total_latency()
@@ -143,23 +177,21 @@ async def entrypoint(ctx: JobContext):
                 )
 
         elif isinstance(ev.metrics, STTMetrics):
-            logger.debug(f"Processing STT metrics: {ev.metrics}")
+            logger.debug(f"STT Metrics: {ev.metrics}")
             if hasattr(ev.metrics, 'duration'):
-                duration_ms = ev.metrics.duration * 1000
-                logger.debug(f"Observed STT latency: {duration_ms}ms")
+                logger.debug(f"STT Duration: {ev.metrics.duration * 1000} ms")
                 logger.info(
                     "STT Metrics",
                     extra={
-                        "latency_ms": duration_ms,
+                        "latency_ms": ev.metrics.duration * 1000,
                         "timestamp": datetime.utcnow().isoformat()
                     }
                 )
 
         elif isinstance(ev.metrics, TTSMetrics):
-            logger.debug(f"Processing TTS metrics: {ev.metrics}")
+            logger.debug(f"TTS Metrics: {ev.metrics}")
             if hasattr(ev.metrics, 'duration'):
-                duration_ms = ev.metrics.duration * 1000
-                logger.debug(f"Observed TTS latency: {duration_ms}ms")
+                logger.debug(f"TTS Duration: {ev.metrics.duration * 1000} ms")
             if hasattr(ev.metrics, 'ttfb'):
                 current_turn_metrics['tts_ttfb'] = ev.metrics.ttfb
                 calculate_total_latency()
@@ -172,7 +204,7 @@ async def entrypoint(ctx: JobContext):
             )
 
         elif isinstance(ev.metrics, VADMetrics):
-            logger.debug(f"Processing VAD metrics: {ev.metrics}")
+            logger.debug(f"VAD Metrics: {ev.metrics}")
             logger.info(
                 "VAD Metrics",
                 extra={
@@ -182,25 +214,20 @@ async def entrypoint(ctx: JobContext):
             )
 
         elif isinstance(ev.metrics, EOUMetrics):
-            logger.debug(f"Processing EOU metrics: {ev.metrics}")
+            logger.debug(f"EOU Metrics: {ev.metrics}")
             if hasattr(ev.metrics, 'end_of_utterance_delay'):
-                delay_ms = ev.metrics.end_of_utterance_delay * 1000
-                logger.debug(f"Observed EOU delay: {delay_ms}ms")
                 current_turn_metrics['eou_delay'] = ev.metrics.end_of_utterance_delay
                 calculate_total_latency()
 
         collector.collect(m)
 
     await session.start(
-        agent=agent,
+        agent=PreResponseAgent(),
         room=ctx.room,
         room_input_options=RoomInputOptions(
             noise_cancellation=noise_cancellation.BVC(),
         ),
     )
-
-    await ctx.connect()
-    await session.generate_reply(instructions="ask the user how they are doing?")
 
     summary = collector.get_summary()
     logger.info(f"Usage summary: {summary}")
