@@ -74,6 +74,37 @@ def prewarm(proc: JobProcess):
 class State(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
 
+# Build LangGraph for main LLM
+
+def build_main_graph():
+    openai_llm = init_chat_model(model="gpt-4o-mini")
+    def main_node(state: State):
+        return {"messages": [openai_llm.invoke(state["messages"])]}
+    builder = StateGraph(State)
+    builder.add_node("main", main_node)
+    builder.add_edge(START, "main")
+    return builder.compile()
+
+# Build LangGraph for fast filler LLM
+def build_filler_graph():
+    fast_llm = init_chat_model(model="gpt-3.5-turbo")
+    # Use ChatMessage, not BaseMessage
+    system_msg = ChatMessage(
+        role="system",
+        content=["Generate a very short instant response (5–10 words) like 'OK', 'Let me think', 'Good question', etc."]
+    )
+
+    def filler_node(state: State):
+        # Prepend the system prompt to the existing conversation
+        context = [system_msg] + state["messages"]
+        response = fast_llm.invoke(context)
+        return {"messages": state["messages"] + [response]}
+
+    builder = StateGraph(State)
+    builder.add_node("filler", filler_node)
+    builder.add_edge(START, "filler")
+    return builder.compile()
+
 class PreResponseAgent(Agent):
     def __init__(self):
         super().__init__(
@@ -145,6 +176,15 @@ async def entrypoint(ctx: JobContext):
             )
             for k in current_turn_metrics:
                 current_turn_metrics[k] = None
+
+    # Build adapters
+    main_graph = build_main_graph()
+    filler_graph = build_filler_graph()
+    main_adapter = langchain.LLMAdapter(main_graph)
+    filler_adapter = langchain.LLMAdapter(filler_graph)
+
+    # Agent uses main_adapter; filler responses sent directly from filler_adapter
+    agent = Agent(instructions="You are \"Nova,\" a concise, friendly voice assistant.", llm=main_adapter)
 
     session = AgentSession(
         vad=ctx.proc.userdata["vad"],
@@ -221,8 +261,20 @@ async def entrypoint(ctx: JobContext):
 
         collector.collect(m)
 
+    # Override on_user_turn_completed to send instant filler via graph adapter
+    async def on_user_finished(turn_ctx, new_msg):
+        # Generate instant filler
+        filler_iter = filler_adapter.invoke(turn_ctx.messages + [new_msg]).to_str_iterable()
+        async def _say_filler():
+            async for chunk in filler_iter:
+                yield chunk
+        session.say(_say_filler(), add_to_chat_ctx=False)
+
+    agent.on_user_turn_completed = on_user_finished
+
     await session.start(
-        agent=PreResponseAgent(),
+        # agent=PreResponseAgent(),
+        agent=agent,
         room=ctx.room,
         room_input_options=RoomInputOptions(
             noise_cancellation=noise_cancellation.BVC(),
