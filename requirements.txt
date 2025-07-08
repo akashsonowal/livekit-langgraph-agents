@@ -1,7 +1,8 @@
 python-dotenv
-langgraph
 langchain[openai]
-langgraph
+langgraph>=0.3.0
+livekit-agents>=1.1.5
+langchain-core>=0.3.0
+livekit-agents[elevenlabs]~=1.0
 livekit-plugins-noise-cancellation~=0.2
 livekit-agents[openai,silero,langchain,deepgram,turn_detector]
-livekit-agents[elevenlabs]~=1.0
