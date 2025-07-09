@@ -1,6 +1,6 @@
 python-dotenv
-langchain[openai]
 langgraph>=0.3.0
+langchain[openai]
 livekit-agents>=1.1.5
 langchain-core>=0.3.0
 livekit-agents[elevenlabs]~=1.0

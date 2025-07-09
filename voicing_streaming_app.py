@@ -8,12 +8,15 @@ from livekit.agents import (
     Agent,
     AgentSession,
     JobContext,
+    JobProcess,
     WorkerOptions,
     cli,
     llm,
 )
 from livekit.agents.llm.chat_context import ChatContext, ChatMessage
 from livekit.plugins import deepgram, elevenlabs, langchain, silero, noise_cancellation, openai
+from livekit.plugins.turn_detector.multilingual import MultilingualModel
+from livekit.agents import metrics, MetricsCollectedEvent
 
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import BaseMessage
@@ -106,17 +109,34 @@ class PreResponseAgent(Agent):
         filler_response = await fast_llm_fut
         logger.info(f"Fast response: {filler_response}")
         turn_ctx.add_message(role="assistant", content=filler_response, interrupted=False)
+
+def prewarm(proc: JobProcess):
+    proc.userdata["vad"] = silero.VAD.load()
     
 async def entrypoint(ctx: JobContext):
-    await ctx.connect()
-
     session = AgentSession(
+        vad=ctx.proc.userdata["vad"],
         stt=deepgram.STT(),
         tts=elevenlabs.TTS(),
-        vad=silero.VAD.load(),
+        turn_detection=MultilingualModel(),
     )
-    await session.start(PreResponseAgent(), room=ctx.room)
+    
+    usage_collector = metrics.UsageCollector()
 
+    @session.on("metrics_collected")
+    def _on_metrics_collected(ev: MetricsCollectedEvent):
+        metrics.log_metrics(ev.metrics)
+        usage_collector.collect(ev.metrics)
+    
+    async def log_usage():
+        summary = usage_collector.get_summary()
+        logger.info(f"Usage: {summary}")
+
+    # shutdown callbacks are triggered when the session is over
+    ctx.add_shutdown_callback(log_usage)
+
+    await session.start(PreResponseAgent(), room=ctx.room)
+    await ctx.connect()
 
 if __name__ == "__main__":
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
